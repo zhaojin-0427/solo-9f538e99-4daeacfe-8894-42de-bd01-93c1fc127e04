@@ -170,7 +170,9 @@ class FetchEngine:
             if not title and not content:
                 self.db.update_ann(ann_id, status="failed", error="no extractable title/content")
                 return
-            self.db.update_ann(ann_id, status="success", title=title, content=content, error=None)
+            # Freshly extracted text: raw title/content plus a clean
+            # (unconfirmed, unrevised) proofreading state.
+            self.db.mark_fetch_success(ann_id, title, content)
             log.info("ann=%s success: %r (%d chars, %d hops, %d retries)",
                      ann_id, title[:60], len(content), hops, attempts)
             return

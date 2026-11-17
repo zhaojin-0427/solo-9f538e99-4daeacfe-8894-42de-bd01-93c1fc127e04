@@ -1,4 +1,4 @@
-"""FastAPI application: submit jobs, query progress, download full corpus."""
+"""FastAPI application: submit jobs, query progress, proofread and publish."""
 import logging
 import os
 import time
@@ -11,13 +11,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, field_validator
 
-from .db import DB
+from .db import DB, EditionError
 from .engine import FetchEngine
 from .extract import extract_document
 
 DB_PATH = os.environ.get("DB_PATH", "./collector.db")
 
 log = logging.getLogger("collector.api")
+
+PROOFREAD_TAGS = ["proofreading & publishing"]
 
 
 @asynccontextmanager
@@ -52,7 +54,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Tender Corpus Collector",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Collect tender announcements from multiple official sites. "
         "Submit up to 20 announcement URLs per job; the collector extracts "
@@ -60,7 +62,12 @@ app = FastAPI(
         "globally, 1 per origin), per-origin cooldowns on 429/503 + "
         "Retry-After, max 3 redirect hops and max 2 retries per URL. "
         "The full JSON corpus is downloadable only when every announcement "
-        "of a job succeeded."
+        "of a job succeeded. "
+        "Proofreaders can then revise and confirm the extracted title/body "
+        "(editing a confirmed announcement invalidates its confirmation); an "
+        "immutable, versioned edition can be published only when the whole "
+        "job succeeded and every announcement is confirmed. Editions and the "
+        "raw extraction are independently downloadable."
     ),
     lifespan=lifespan,
 )
@@ -87,6 +94,58 @@ class JobCreate(BaseModel):
         return out
 
 
+class RevisionCreate(BaseModel):
+    title: str | None = Field(
+        default=None,
+        description="Revised title. Omit to keep the current working title.",
+    )
+    content: str | None = Field(
+        default=None,
+        description="Revised body text. Omit to keep the current working content.",
+    )
+
+    @field_validator("title", "content")
+    @classmethod
+    def reject_empty_strings(cls, v):
+        if v is not None and not v.strip():
+            raise ValueError("revised text must not be empty or whitespace-only")
+        return v
+
+
+def _working_title(row) -> str:
+    return row["title"] if row["revised_title"] is None else row["revised_title"]
+
+
+def _working_content(row) -> str:
+    return row["content"] if row["revised_content"] is None else row["revised_content"]
+
+
+def _announcement_view(a) -> dict:
+    """Serialization of one announcement including proofreading state."""
+    return {
+        "id": a["id"],
+        "url": a["url"],
+        "current_url": a["current_url"],
+        "status": a["status"],
+        "hops": a["hops"],
+        "attempts": a["attempts"],
+        # raw, untouched extraction output (also used by the raw download)
+        "raw_title": a["title"],
+        "raw_content": a["content"],
+        # current working text (revision applied, if any)
+        "working_title": _working_title(a),
+        "working_content": _working_content(a),
+        "revised_title": a["revised_title"],
+        "revised_content": a["revised_content"],
+        "confirmed": bool(a["confirmed"]),
+        "confirmed_title": a["confirmed_title"],
+        "confirmed_content": a["confirmed_content"],
+        "confirmed_at": a["confirmed_at"],
+        "error": a["error"],
+        "updated_at": a["updated_at"],
+    }
+
+
 @app.get("/", include_in_schema=False)
 async def root():
     return RedirectResponse(url="/docs")
@@ -107,6 +166,7 @@ async def create_job(payload: JobCreate):
         "status": "running",
         "progress_url": f"/jobs/{job_id}",
         "download_url": f"/jobs/{job_id}/download",
+        "editions_url": f"/jobs/{job_id}/editions",
     }
 
 
@@ -131,10 +191,27 @@ def _job_or_404(job_id: str):
     return job
 
 
-@app.get("/jobs/{job_id}", summary="Job progress with per-announcement status")
+def _successful_ann_or_409(job_id: str, ann_id: int):
+    """Fetch the announcement and ensure it belongs to the job and succeeded."""
+    _job_or_404(job_id)
+    ann = app.state.db.get_announcement_for_job(job_id, ann_id)
+    if ann is None:
+        raise HTTPException(status_code=404, detail="announcement not found in this job")
+    if ann["status"] != "success":
+        raise HTTPException(
+            status_code=409,
+            detail=f"announcement {ann_id} is not collected successfully "
+                   f"(current status: {ann['status']}); only successful announcements "
+                   "can be proofread",
+        )
+    return ann
+
+
+@app.get("/jobs/{job_id}", summary="Job progress with per-announcement and proofreading state")
 async def job_progress(job_id: str):
     job = _job_or_404(job_id)
-    anns = app.state.db.list_announcements(job_id)
+    db: DB = app.state.db
+    anns = db.list_announcements(job_id)
     counts = Counter(a["status"] for a in anns)
     if counts["pending"] or counts["fetching"]:
         status = "running"
@@ -142,6 +219,8 @@ async def job_progress(job_id: str):
         status = "failed"
     else:
         status = "success"
+    confirmed = sum(1 for a in anns if a["confirmed"])
+    editions = db.list_editions(job_id)
     return {
         "job_id": job_id,
         "status": status,
@@ -151,26 +230,18 @@ async def job_progress(job_id: str):
         "fetching": counts["fetching"],
         "success": counts["success"],
         "failed": counts["failed"],
-        "downloadable": status == "success",
-        "announcements": [
-            {
-                "id": a["id"],
-                "url": a["url"],
-                "current_url": a["current_url"],
-                "status": a["status"],
-                "hops": a["hops"],
-                "attempts": a["attempts"],
-                "title": a["title"],
-                "error": a["error"],
-                "updated_at": a["updated_at"],
-            }
-            for a in anns
-        ],
+        "confirmed": confirmed,
+        "all_confirmed": confirmed == len(anns) and len(anns) > 0 and status == "success",
+        "raw_downloadable": status == "success",
+        "editions": [dict(e) for e in editions],
+        "announcements": [_announcement_view(a) for a in anns],
     }
 
 
-@app.get("/jobs/{job_id}/download", summary="Download full JSON corpus (only when ALL succeeded)")
-async def download_corpus(job_id: str):
+@app.get("/jobs/{job_id}/download",
+         summary="Download the RAW extracted JSON corpus (only when ALL succeeded)")
+async def download_raw_corpus(job_id: str):
+    """Original extraction output. Proofreading never alters this payload."""
     _job_or_404(job_id)
     anns = app.state.db.list_announcements(job_id)
     not_done = [a for a in anns if a["status"] != "success"]
@@ -195,13 +266,131 @@ async def download_corpus(job_id: str):
     ]
     payload = {
         "job_id": job_id,
+        "kind": "raw",
         "generated_at": time.time(),
         "document_count": len(documents),
         "documents": documents,
     }
     return JSONResponse(
         content=payload,
-        headers={"Content-Disposition": f'attachment; filename="corpus-{job_id}.json"'},
+        headers={"Content-Disposition": f'attachment; filename="corpus-{job_id}-raw.json"'},
+    )
+
+
+# ----------------------------------------------------------------------
+# Proofreading & publishing
+# ----------------------------------------------------------------------
+@app.post(
+    "/jobs/{job_id}/announcements/{ann_id}/revisions",
+    tags=PROOFREAD_TAGS,
+    summary="Submit a revision for one successfully collected announcement",
+)
+async def revise_announcement(job_id: str, ann_id: int, payload: RevisionCreate):
+    if payload.title is None and payload.content is None:
+        raise HTTPException(
+            status_code=422,
+            detail="provide at least one of 'title' or 'content' to revise",
+        )
+    _successful_ann_or_409(job_id, ann_id)
+    db: DB = app.state.db
+    updated = db.save_revision(ann_id, title=payload.title, content=payload.content)
+    return {
+        "announcement": _announcement_view(updated),
+        "message": "revision saved; confirmation is required before publishing",
+    }
+
+
+@app.post(
+    "/jobs/{job_id}/announcements/{ann_id}/confirm",
+    tags=PROOFREAD_TAGS,
+    summary="Confirm the current working title/body of one announcement",
+)
+async def confirm_announcement(job_id: str, ann_id: int):
+    _successful_ann_or_409(job_id, ann_id)
+    db: DB = app.state.db
+    updated = db.confirm_announcement(ann_id)
+    return {
+        "announcement": _announcement_view(updated),
+        "message": "current working text confirmed",
+    }
+
+
+@app.post(
+    "/jobs/{job_id}/editions",
+    tags=PROOFREAD_TAGS,
+    status_code=201,
+    summary="Publish a new immutable proofread edition (all success + all confirmed)",
+)
+async def publish_edition(job_id: str):
+    _job_or_404(job_id)
+    db: DB = app.state.db
+    try:
+        edition = db.create_edition(job_id)
+    except EditionError as exc:
+        msg = str(exc)
+        # Unknown job is a 404; every other precondition failure is a 409.
+        raise HTTPException(status_code=404 if "job not found" in msg else 409, detail=msg)
+    edition["download_url"] = f"/jobs/{job_id}/editions/{edition['version']}/download"
+    return edition
+
+
+@app.get(
+    "/jobs/{job_id}/editions",
+    tags=PROOFREAD_TAGS,
+    summary="List published editions of a job (versioned, immutable)",
+)
+async def list_editions(job_id: str):
+    _job_or_404(job_id)
+    rows = app.state.db.list_editions(job_id)
+    return {
+        "job_id": job_id,
+        "editions": [
+            {
+                **dict(r),
+                "download_url": f"/jobs/{job_id}/editions/{r['version']}/download",
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get(
+    "/jobs/{job_id}/editions/{version}/download",
+    tags=PROOFREAD_TAGS,
+    summary="Download one published edition by version number (frozen snapshot)",
+)
+async def download_edition(job_id: str, version: int):
+    _job_or_404(job_id)
+    db: DB = app.state.db
+    edition = db.get_edition(job_id, version)
+    if edition is None:
+        raise HTTPException(status_code=404, detail=f"edition v{version} not found")
+    rows = db.list_edition_documents(job_id, version)
+    documents = [
+        {
+            "announcement_id": r["ann_id"],
+            "url": r["url"],
+            "final_url": r["final_url"],
+            "hops": r["hops"],
+            "title": r["title"],
+            "content": r["content"],
+        }
+        for r in rows
+    ]
+    payload = {
+        "job_id": job_id,
+        "kind": "edition",
+        "version": version,
+        "published_at": edition["created_at"],
+        "document_count": edition["document_count"],
+        "documents": documents,
+    }
+    return JSONResponse(
+        content=payload,
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="corpus-{job_id}-v{version}.json"'
+        },
     )
 
 
